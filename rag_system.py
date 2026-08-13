@@ -5,6 +5,7 @@ os.environ["OMP_NUM_THREADS"] = "2"
 os.environ["MKL_NUM_THREADS"] = "2"
 os.environ["ONNXRUNTIME_NUM_THREADS"] = "2"
 
+import re
 from typing import List, Dict, Any
 from openai import OpenAI
 from foundry_local_sdk import FoundryLocalManager, Configuration
@@ -97,7 +98,7 @@ class RAGSystem:
         from ingestion import ingest_file
         ingest_file(self.db_path, file_path, self._emb_client)
 
-    def ask(self, question: str, top_k: int = 3, max_tokens: int = 512) -> str:
+    def ask(self, question: str, top_k: int = 3, max_tokens: int = 1024) -> str:
         """
         Answers a question using the RAG pipeline:
           1. Embeds the question using the embedding model.
@@ -135,18 +136,22 @@ class RAGSystem:
 
         # 4. Build prompts (ASCII-safe for Windows console compatibility)
         system_prompt = (
-            "Sen yardimci bir AI asistanisin. "
-            "Asagidaki belge bolumlerini kullanarak soruyu Turkce veya soruyla ayni dilde yanitla. "
-            "Eger belgeler soruyu yanitlamak icin yeterli bilgi icermiyorsa, bunu acikca belirt. "
-            "Yanitinda yalnizca belgelerden elde ettigin bilgileri kullan."
+            "You are a helpful assistant. "
+            "Answer the question using ONLY the document sections provided below. "
+            "Give a direct, concise answer. "
+            "Do NOT list, repeat, or reference the source chunks. "
+            "Do NOT output chunk names, bolum numbers, or kaynak labels. "
+            "If the documents do not contain enough information, say so clearly. "
+            "/no_think"
         )
 
         user_prompt = (
-            f"Asagidaki belge bolumleri saglanmistir:\n\n"
+            f"/no_think\n\n"
+            f"Document sections:\n\n"
             f"{context}\n\n"
             f"---\n\n"
-            f"Soru: {question}\n\n"
-            f"Yanit:"
+            f"Question: {question}\n\n"
+            f"Answer:"
         )
 
         # 5. Call local LLM
@@ -157,10 +162,30 @@ class RAGSystem:
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=max_tokens,
-            temperature=0.2,
+            temperature=0.3,
+            presence_penalty=0.5,
+            frequency_penalty=0.5,
         )
 
-        return response.choices[0].message.content.strip()
+        raw = response.choices[0].message.content or ""
+
+        # Strip <think>...</think> blocks produced by Qwen3 reasoning mode, even if unclosed
+        cleaned = re.sub(r"<think>.*?(?:</think>|$)", "", raw, flags=re.DOTALL).strip()
+
+        # Cut off anything that looks like repeated chunk/source listings
+        # Pattern: line starting with [Kaynak or **Bolum or **Yanit
+        cutoff = re.search(
+            r"\n\s*\n\s*(\[Kaynak|\*\*Bolum|\*\*Yanit|Bolum \d+:)",
+            cleaned,
+        )
+        if cutoff:
+            cleaned = cleaned[: cutoff.start()].strip()
+
+        # Fallback: if nothing remains, return a clear message
+        if not cleaned:
+            return "Model yanit uretirken bos sonuc dondu. Lutfen soruyu tekrar deneyin."
+
+        return cleaned
 
     def list_documents(self) -> List[Dict[str, Any]]:
         """Returns a list of all ingested documents from the database."""
